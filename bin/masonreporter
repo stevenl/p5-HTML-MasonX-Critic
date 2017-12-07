@@ -1,0 +1,599 @@
+#!/usr/bin/env perl
+
+# PODNAME: bin/masonreporter
+# ABSTRACT: A tool for creating reports about Mason pages
+
+use strict;
+use warnings;
+use FindBin;
+
+use lib "$FindBin::Bin/../lib";
+
+$!++; # autoflushin'
+
+use DBI;
+use Term::ReadKey       ();
+use Path::Tiny          'path';
+use Getopt::Long        'GetOptions';
+use IO::Prompt::Tiny    'prompt';
+use Term::ANSIColor     ':constants';
+
+use HTML::MasonX::Inspector;
+use HTML::MasonX::Inspector::Util::MasonFileFinder;
+
+my $DEBUG   = $ENV{MASONREPORTER_DEBUG};
+my $VERBOSE = $ENV{MASONREPORTER_VERBOSE};
+
+my ($dir, $db_file);
+
+GetOptions(
+    'debug|d'   => \$DEBUG,
+    'verbose|v' => \$VERBOSE,
+    'dir=s'     => \$dir,
+    'db-file=s' => \$db_file,
+);
+
+## Check the args
+
+usage('You must specify a --dir')
+    unless defined $dir;
+
+usage('The --dir must be a valid directory.')
+    unless -e $dir && -d $dir;
+
+usage('You must specify a --db-file')
+    unless defined $db_file;
+
+usage('The --db-file already exists, no overwriting.')
+    if -f $db_file;
+
+## Set up globals
+
+my $ROOT_DIR = path( $dir );
+my $DB_FILE  = path( $db_file );
+
+my $inspector = HTML::MasonX::Inspector->new( comp_root => $ROOT_DIR, use_warnings => 1 );
+my $finder    = HTML::MasonX::Inspector::Util::MasonFileFinder->new( root_dir => $ROOT_DIR );
+my $all_files = $finder->find_all_mason_files;
+
+sub init_report;
+sub finish_report;
+sub insert_new_component;
+
+init_report();
+
+while ( my $file = $all_files->next ) {
+    my $rel      = $file->relative( $ROOT_DIR );
+    my $compiler = $inspector->get_compiler_inspector_for_path( $rel );
+
+    insert_new_component( $compiler );
+}
+
+finish_report();
+
+exit;
+
+## ------------------------------------------
+
+sub usage {
+    my ($error) = @_;
+    print $error, "\n" if $error;
+    print <<'USAGE';
+masonreporter [-dv] [long options...]
+    --dir                  the root directory to look within
+    --db-file              the name of the SQLite DB file to create
+    -d --debug             turn on debugging
+    -v --verbose           turn on verbosity
+USAGE
+    exit(0);
+}
+
+## ------------------------------------------
+
+my $DBH;
+my $CURRENT_FILE_ID;
+my $CURRENT_BLOCK_ID;
+
+sub init_report {
+    init_dbh();
+    setup_report_tables();
+}
+
+sub finish_report {
+    $DBH->disconnect;
+}
+
+## ...
+
+sub init_dbh {
+    $DBH = DBI->connect(
+        ('dbi:SQLite:dbname='.$DB_FILE, '', ''),
+        { PrintError => 0, RaiseError => 1 }
+    );
+}
+
+sub setup_report_tables {
+
+    $DBH->do(q[
+        CREATE TABLE `component` (
+            `component_id` INTEGER,
+            `path`         TEXT NOT NULL,
+            `type`         TEXT NOT NULL, -- sub|main|method
+            `inherit_flag` TEXT NOT NULL, -- value of <%flags>
+            `checksum`     TEXT NOT NULL,
+
+            PRIMARY KEY(`component_id` ASC)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `arg` (
+            `arg_id`        INTEGER,
+            `sigil`         TEXT NOT NULL,
+            `symbol`        TEXT NOT NULL,
+            `default_value` TEXT NOT NULL,
+            `line_number`   INTEGER NOT NULL,
+            `component_id`  INTEGER NOT NULL, -- refs component.component_id
+
+            PRIMARY KEY(`arg_id` ASC),
+            FOREIGN KEY(`component_id`) REFERENCES file(`component_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `attr` (
+            `attr_id`      INTEGER,
+            `name`         TEXT NOT NULL,
+            `value`        TEXT NOT NULL,
+            `component_id` INTEGER NOT NULL, -- refs component.component_id
+
+            PRIMARY KEY(`attr_id` ASC),
+            FOREIGN KEY(`component_id`) REFERENCES file(`component_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `perl_code` (
+            `perl_code_id`             INTEGER,
+            `type`                 TEXT NOT NULL, -- main|once|init|filter|cleanup|shared
+            `checksum`             TEXT NOT NULL,
+            `size`                 INTEGER NOT NULL,
+            `number_of_lines`      INTEGER NOT NULL,
+            `starting_line_number` INTEGER NOT NULL,
+            `component_id`         INTEGER NOT NULL, -- refs component.component_id
+
+            PRIMARY KEY(`perl_code_id` ASC),
+            FOREIGN KEY(`component_id`) REFERENCES file(`component_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `perl_used_module` (
+            `perl_used_module_id`  INTEGER,
+            `line_number`          INTEGER NOT NULL,
+            `column_number`        INTEGER NOT NULL,
+            `type`                 TEXT NOT NULL,    -- runtime|conditional|pragma|perl_version
+            `module`               TEXT NOT NULL,
+            `module_version`       TEXT NOT NULL,
+            `does_not_call_import` BOOLEAN NOT NULL,
+            `perl_code_id`         INTEGER NOT NULL, -- refs perl_code.perl_code_id
+
+            PRIMARY KEY(`perl_used_module_id` ASC),
+            FOREIGN KEY(`perl_code_id`) REFERENCES perl_code(`perl_code_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `perl_used_module_imported_token` (
+            `perl_used_module_imported_token_id`  INTEGER,
+            `token`                               TEXT NOT NULL,
+            `is_tag`                              BOOLEAN NOT NULL,
+            `perl_used_module_id`                 INTEGER NOT NULL, -- refs perl_used_module.perl_used_module_id
+
+            PRIMARY KEY(`perl_used_module_imported_token_id` ASC),
+            FOREIGN KEY(`perl_used_module_id`) REFERENCES perl_used_module(`perl_used_module_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `constant_declaration` (
+            `constant_declaration_id` INTEGER,
+            `line_number`             INTEGER NOT NULL,
+            `column_number`           INTEGER NOT NULL,
+            `symbol`                  TEXT NOT NULL,
+            `arguments`               TEXT NOT NULL,
+            `perl_code_id`            INTEGER NOT NULL, -- refs perl_code.perl_code_id
+
+            PRIMARY KEY(`constant_declaration_id` ASC),
+            FOREIGN KEY(`perl_code_id`) REFERENCES perl_code(`perl_code_id`)
+        )
+    ]);
+
+    $DBH->do(q[
+        CREATE TABLE `subroutine_declaration` (
+            `subroutine_declaration_id` INTEGER,
+            `line_number`               INTEGER NOT NULL,
+            `column_number`             INTEGER NOT NULL,
+            `symbol`                    TEXT NOT NULL,
+            `perl_code_id`              INTEGER NOT NULL, -- refs perl_code.perl_code_id
+
+            PRIMARY KEY(`subroutine_declaration_id` ASC),
+            FOREIGN KEY(`perl_code_id`) REFERENCES perl_code(`perl_code_id`)
+        )
+    ]);
+}
+
+## Inserts ...
+
+sub insert_new_component {
+    my ($path, $checksum) = @_;
+
+    die('You must specify a path')
+        unless defined $path;
+
+    die('The path must be an instance of Path::Tiny')
+        unless Scalar::Util::blessed($path) && $path->isa('Path::Tiny');
+
+    die('You must specify a checksum')
+        unless defined $checksum;
+
+    my $SQL = q[
+        INSERT INTO `file` (
+            `path` ,
+            `checksum`
+        ) VALUES(?, ?)
+    ];
+
+    $DBH->do(
+        $SQL, {},
+        $path->stringify,
+        $checksum
+    );
+
+    $CURRENT_FILE_ID  = $DBH->last_insert_id( undef, undef, undef, undef, {} );
+    $CURRENT_BLOCK_ID = undef;
+}
+
+sub insert_args {
+    my (@args) = @_;
+
+    die('Cannot insert args without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `arg` (
+            `name` ,
+            `default`,
+            `has_constraint`,
+            `line_number`,
+            `file_id`
+        ) VALUES(?, ?, ?, ?, ?)
+    ];
+
+    foreach my $arg ( @args ) {
+        $DBH->do(
+            $SQL, {},
+            $arg->{name},
+            $arg->{default},
+            $arg->{has_constraint},
+            $arg->{line_number},
+            $CURRENT_FILE_ID,
+        );
+    }
+}
+
+sub insert_flags {
+    my (@flags) = @_;
+
+    die('Cannot insert flags without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `flag` (
+            `name`,
+            `value`,
+            `file_id`
+        ) VALUES(?, ?, ?)
+    ];
+
+    foreach my $flag ( @flags ) {
+        $DBH->do(
+            $SQL, {},
+            $flag->{name},
+            $flag->{value},
+            $CURRENT_FILE_ID,
+        );
+    }
+}
+
+sub insert_attr {
+    my (@attrs) = @_;
+
+    die('Cannot insert attr without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `attr` (
+            `name`,
+            `value`,
+            `file_id`
+        ) VALUES(?, ?, ?)
+    ];
+
+    foreach my $attr ( @attrs ) {
+        $DBH->do(
+            $SQL, {},
+            $attr->{name},
+            $attr->{value},
+            $CURRENT_FILE_ID,
+        );
+    }
+}
+
+sub insert_defs {
+    my (@defs) = @_;
+
+    die('Cannot insert defs without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `def` (
+            `name`,
+            `arg_count`,
+            `body_size`,
+            `body_line_count`,
+            `file_id`
+        ) VALUES(?, ?, ?, ?, ?)
+    ];
+
+    foreach my $def ( @defs ) {
+        $DBH->do(
+            $SQL, {},
+            $def->{name},
+            (scalar @{ $def->{args} }),
+            $def->{body}->size,
+            $def->{body}->lines,
+            $CURRENT_FILE_ID,
+        );
+    }
+
+    # TODO: def args
+    # TODO: def body
+}
+
+sub insert_methods {
+    my (@methods) = @_;
+
+    die('Cannot insert methods without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `method` (
+            `name` ,
+            `arg_count`,
+            `body_size`,
+            `body_line_count`,
+            `file_id`
+        ) VALUES(?, ?, ?, ?, ?)
+    ];
+
+    foreach my $method ( @methods ) {
+        $DBH->do(
+            $SQL, {},
+            $method->{name},
+            (scalar @{ $method->{args} }),
+            $method->{body}->size,
+            $method->{body}->lines,
+            $CURRENT_FILE_ID,
+        );
+    }
+
+    # TODO: method args
+    # TODO: method body
+}
+
+sub insert_violations {
+    my (@violations) = @_;
+
+    die('Cannot insert new violation without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `violation` (
+            `line_number`,
+            `column_number`,
+            `severity`,
+            `policy`,
+            `source`,
+            `description`,
+            `file_id`
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+    ];
+
+    foreach my $violation ( @violations ) {
+        $DBH->do(
+            $SQL, {},
+            $violation->line_number,
+            $violation->column_number,
+            $violation->severity,
+            $violation->policy,
+            $violation->source,
+            $violation->description,
+            $CURRENT_FILE_ID,
+        );
+    }
+}
+
+sub insert_new_block {
+    my ($type, $block) = @_;
+
+    die('You must specify a type')
+        unless defined $type;
+
+    die('You must specify a block')
+        unless defined $block;
+
+    die('The block must be an instance of HTML::MasonX::Inspector::Util::Perl')
+        unless Scalar::Util::blessed($block)
+            && $block->isa('HTML::MasonX::Inspector::Util::Perl');
+
+    die('Cannot insert new block without current file')
+        unless $CURRENT_FILE_ID;
+
+    my $SQL = q[
+        INSERT INTO `block` (
+            `type`,
+            `checksum`,
+            `size`,
+            `lines`,
+            `starting_line_number`,
+            `does_mason_postproc`,
+            `might_abort_request`,
+            `might_redirect_user`,
+            `complexity_score`,
+            `number_of_includes`,
+            `number_of_constants`,
+            `number_of_subroutines`,
+            `file_id`
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ];
+
+    $DBH->do(
+        $SQL, {},
+        $type,
+        $block->checksum,
+        $block->size,
+        $block->lines,
+        $block->starting_line_number,
+        $block->does_mason_postproc,
+        $block->might_abort_request,
+        $block->might_redirect_user,
+        $block->complexity_score,
+        $block->number_of_includes,
+        $block->number_of_constants,
+        $block->number_of_subroutines,
+        $CURRENT_FILE_ID,
+    );
+
+    $CURRENT_BLOCK_ID = $DBH->last_insert_id( undef, undef, undef, undef, {} );
+}
+
+sub insert_new_include {
+    my ($include) = @_;
+
+    die('You must specify an include')
+        unless defined $include;
+
+    die('Cannot insert new include without current block')
+        unless $CURRENT_BLOCK_ID;
+
+    my $include_SQL = q[
+        INSERT INTO `include` (
+            `line_number`,
+            `column_number`,
+            `type`,
+            `module`,
+            `number_of_imports`,
+            `is_conditional`,
+            `does_not_call_import`,
+            `block_id`
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    ];
+
+    $DBH->do(
+        $include_SQL, {},
+        $include->line_number,
+        $include->column_number,
+        $include->type,
+        $include->module,
+        $include->number_of_imports,
+        $include->is_conditional,
+        $include->does_not_call_import,
+        $CURRENT_BLOCK_ID,
+    );
+
+    my $include_id = $DBH->last_insert_id( undef, undef, undef, undef, {} );
+    my $import_SQL = q[
+        INSERT INTO `import` (
+            `token`,
+            `is_tag`,
+            `include_id`
+        ) VALUES(?, ?, ?)
+    ];
+
+    foreach my $import ( $include->imports ) {
+        $DBH->do(
+            $import_SQL, {},
+            $import->token,
+            $import->is_tag,
+            $include_id
+        );
+    }
+}
+
+sub insert_new_constant {
+    my ($constant) = @_;
+
+    die('You must specify an constant')
+        unless defined $constant;
+
+    die('Cannot insert new constant without current block')
+        unless $CURRENT_BLOCK_ID;
+
+    my $constant_SQL = q[
+        INSERT INTO `constant` (
+            `line_number`,
+            `column_number`,
+            `symbol`,
+            `arguments`,
+            `block_id`
+        ) VALUES(?, ?, ?, ?, ?)
+    ];
+
+    $DBH->do(
+        $constant_SQL, {},
+        $constant->line_number,
+        $constant->column_number,
+        $constant->symbol,
+        (join ', ' => $constant->arguments),
+        $CURRENT_BLOCK_ID,
+    );
+}
+
+sub insert_new_subroutine {
+    my ($subroutine) = @_;
+
+    die('You must specify an subroutine')
+        unless defined $subroutine;
+
+    die('Cannot insert new subroutine without current block')
+        unless $CURRENT_BLOCK_ID;
+
+    my $subroutine_SQL = q[
+        INSERT INTO `subroutine` (
+            `line_number`,
+            `column_number`,
+            `symbol`,
+            `block_id`
+        ) VALUES(?, ?, ?, ?)
+    ];
+
+    $DBH->do(
+        $subroutine_SQL, {},
+        $subroutine->line_number,
+        $subroutine->column_number,
+        $subroutine->symbol,
+        $CURRENT_BLOCK_ID,
+    );
+}
+
+
+1;
+
+__END__
+
+=pod
+
+=head1 DESCRIPTION
+
+=cut
